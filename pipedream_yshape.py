@@ -18,6 +18,7 @@ from anuga import rectangular_cross_domain
 import anuga
 import numpy as np
 import math
+import time
 
 # ------------------------------------------------------------------------------
 # Setup computational domain
@@ -111,27 +112,27 @@ x = domain.centroid_coordinates[:, 0]
 y = domain.centroid_coordinates[:, 1]
 indices = np.where(x < 10)
 
+dplotter1 = anuga.Domain_plotter(domain)
+
 from pipedream_solver.hydraulics import SuperLink
 import matplotlib.pyplot as plt
 import pandas as pd
 
 superjunctions = pd.DataFrame({'name' : [0, 1, 2], 'id' : [0, 1, 2], 'z_inv' : [-4., -4., -6.], 'h_0' : 3*[1e-5], 'bc' : 3*[False], 'storage' : 3*['functional'], 'a' : 3*[0.], 'b' : 3*[0.], 'c' : 3*[1.], 'max_depth' : 3*[np.inf], 'map_x' : 3*[0], 'map_y' : 3*[0]})
 
-superlinks = pd.DataFrame({'name' : [0, 1], 'id' : [0, 1], 'sj_0' : [0, 1], 'sj_1' : [1, 2], 'in_offset' : 2*[0.], 'out_offset' : 2*[0.], 'dx' : [4., 11.], 'n' : 2*[0.01], 'shape' : 2*['circular'], 'g1' : [0.5, 0.25], 'g2' : 2*[0.], 'g3' : 2*[0.], 'g4' : 2*[0.], 'Q_0' : 2*[0.], 'h_0' : 2*[1e-5], 'ctrl' : 2*[False], 'A_s' : 2*[0.25], 'A_c' : 2*[0.], 'C' : 2*[0.] })
+superlinks = pd.DataFrame({'name' : [0, 1], 'id' : [0, 1], 'sj_0' : [0, 1], 'sj_1' : [1, 2], 'in_offset' : 2*[0.], 'out_offset' : 2*[0.], 'dx' : [4., 11.], 'n' : 2*[0.01], 'shape' : 2*['circular'], 'g1' : [0.5, 0.25], 'g2' : [0.05, 0.05], 'g3' : 2*[0.], 'g4' : 2*[0.], 'Q_0' : 2*[0.], 'h_0' : 2*[1e-5], 'ctrl' : 2*[False], 'A_s' : 2*[1e-3], 'A_c' : 2*[0.], 'C' : 2*[0.], 'C_uk' : 2*[0.1], 'C_dk' : 2*[0.1] })
 
-superlink = SuperLink(superlinks, superjunctions, internal_links=10)
+superlink = SuperLink(superlinks, superjunctions, internal_links=10, mobile_elements=True, min_depth=0.)
 
 surface_elev = np.array([-3, -3, -5])
 
 input_velocity = 1
-dt = 1.0
+dt = 1.
 H_js = []
+Q_s = []
 losses = []
 
-for t in domain.evolve(yieldstep=dt, finaltime=100.0):
-    print('\n')
-    domain.print_timestepping_statistics()
-
+def coupling_function(domain, coupled_model):
     anuga_depths = np.array([inlet1_anuga_inlet_op.inlet.get_average_depth(),
                              inlet2_anuga_inlet_op.inlet.get_average_depth(),
                              outlet_anuga_inlet_op.inlet.get_average_depth()])
@@ -139,19 +140,25 @@ for t in domain.evolve(yieldstep=dt, finaltime=100.0):
     # Compute inflow/outflow to sewer
     C_w = 0.67
     L_w = 0.1 * 2 * np.pi
-    Q_in = np.where(superlink.H_j <= surface_elev,
+    Q_in = np.where(coupled_model.H_j <= surface_elev,
                     C_w * L_w * np.sqrt(anuga_depths) * anuga_depths,
-                    C_w * L_w * np.sqrt(np.abs(anuga_depths - (superlink.H_j - surface_elev)))
-                    * anuga_depths - (superlink.H_j - surface_elev))
-
+                    C_w * L_w * np.sqrt(np.abs(anuga_depths - (coupled_model.H_j - surface_elev)))
+                    * anuga_depths - (coupled_model.H_j - surface_elev))
     # Simulate sewer with flow input
-    superlink.step(Q_in=Q_in, dt=dt)
-    superlink.reposition_junctions()
+    coupled_model.step(Q_in=Q_in, dt=domain.timestep)
+    coupled_model.reposition_junctions()
 
     # Add/remove flows from surface domain
     inlet1_anuga_inlet_op.set_Q(-Q_in[0])
     inlet2_anuga_inlet_op.set_Q(-Q_in[1])
     outlet_anuga_inlet_op.set_Q(-Q_in[2])
+
+start_t = time.time()
+for t in domain.evolve(yieldstep=dt, finaltime=100.0,
+                       coupling_function=coupling_function,
+                       coupling_args=(domain, superlink)):
+    print('\n')
+    domain.print_timestepping_statistics()
 
     # Compute volumes
     link_volume = ((superlink._A_ik * superlink._dx_ik).sum() +
@@ -165,9 +172,18 @@ for t in domain.evolve(yieldstep=dt, finaltime=100.0):
     # Append data
     losses.append(loss)
     H_js.append(superlink.H_j.copy())
+    Q_s.append(superlink.Q_ik.copy())
 
+    # Plot
+    dplotter1.save_depth_frame(vmin=0.0,vmax=1.0)
+end_t = time.time()
 
 H_j = np.vstack(H_js)
+Q_ik = np.vstack(Q_s)
+
+anim = dplotter1.make_depth_animation()
+anim.save('anim_test.mp4',
+          writer = 'ffmpeg', fps = 30)
 
 plt.plot(H_j[:,0], label='Inlet 1')
 plt.plot(H_j[:,1], label='Inlet 2')
@@ -176,4 +192,10 @@ plt.legend()
 plt.title('Head at junctions')
 plt.xlabel('Time (s)')
 plt.ylabel('Head (m)')
+plt.axhline(-4 + 0.5, linestyle='--', c='k')
+plt.axhline(-4 + 0.25, linestyle='--', c='k')
+plt.axhline(-6 + 0.5, linestyle='--', c='k')
+plt.axhline(-6 + 0.25, linestyle='--', c='k')
 plt.show()
+
+
